@@ -126,6 +126,82 @@ The protocol identity is `rwkv-generative-v2`. Use a separate output/checkpoint
 directory for runs made before this version. Old raw answers need a versioned
 replay before their scores can be published using the new protocol.
 
+### Qwen Chat API
+
+`qwen-remote-chat` uses an OpenAI-compatible `/v1/chat/completions` service
+(for example a Qwen deployment served by vLLM). The server applies the official
+Qwen chat template. Both native generation tasks and multiple-choice tasks use
+generation, including the same per-document avg@k rollout accounting as RWKV.
+Models in a campaign may select this backend individually.
+
+Replace `[rwkv_profile]` with `[qwen_profile]`. Declare `enable_thinking`,
+`temperature`, `top_p`, and `top_k` explicitly; parameters are not inferred from
+the service's defaults. `presence_penalty` and `frequency_penalty` default to
+zero, and `max_gen_toks` defaults to 8192. A task's output-token limit can shorten
+this budget. `penalty_decay`, RWKV template fields, and the RWKV-specific
+`generation_config` request field are not sent. Set `OPENAI_API_KEY` if the
+inference service requires authentication.
+
+For example, a Qwen3.5-2B non-thinking run with explicit sampling:
+
+```toml
+schema_version = 1
+backend = "qwen-remote-chat"
+model_name = "Qwen3.5-2B" # Must match the served API model name.
+weight_revision = "Qwen3.5-2B-ctx262144"
+base_url = "http://127.0.0.1:8000/v1/chat/completions"
+benchmarks = ["race", "wmdp", "mc_taco", "mutual", "winogender", "discrim_eval"]
+output_dir = "results/Qwen3.5-2B-nocot"
+max_length = 32768 # Must match the deployed service's limit.
+max_num_seqs = 32 # Must match the deployed service's concurrency capacity.
+log_samples = true
+
+[qwen_profile]
+enable_thinking = false
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+presence_penalty = 1.5
+frequency_penalty = 0.0
+max_gen_toks = 8192
+
+[publication]
+enabled = true
+base_url = "http://127.0.0.1:7862"
+token_env = "SCOREBOARD_PUBLICATION_TOKEN"
+cot_mode = "NoCoT"
+dry_run = true # Validate artifacts locally; false enables actual publication.
+
+[publication.tasks.race]
+field = "reasoning"
+[publication.tasks.wmdp]
+field = "knowledge"
+[publication.tasks.mc_taco]
+field = "reasoning"
+[publication.tasks.mutual]
+field = "reasoning"
+[publication.tasks.winogender]
+field = "reasoning"
+[publication.tasks.discrim_eval]
+field = "reasoning"
+```
+
+Use `cot_mode = "CoT"` with `enable_thinking = true`. Mismatched labels are
+rejected. Qwen3.5 names such as `Qwen/Qwen3.5-0.8B`, `Qwen3.5-2B`,
+`Qwen3.5-4B`, and `Qwen3.5-9B` publish as architecture `qwen`, version `3.5`,
+and their actual parameter size. The receiving Scoreboard must support these
+model identities. For RULER or other tokenizer-dependent synthetic tasks,
+add top-level `tokenizer_name = "Qwen/Qwen3.5-2B"`; it supplies the tokenizer
+to task construction while chat templating remains on the server.
+
+Scoreboard reads the native weight context from `weight_revision`, then from
+the model name or artifact path for older runs. It never substitutes the
+evaluation's shorter `max_length`. The example's native 262144 context is
+recorded in the [official Qwen3.5-2B configuration](https://huggingface.co/Qwen/Qwen3.5-2B/blob/main/config.json).
+Keep the actual released revision in this field for fine-tuned or quantized
+weights as well.
+
+---
 
 ## One file per benchmark set
 

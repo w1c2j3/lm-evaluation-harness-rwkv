@@ -41,6 +41,10 @@ PARAM_SIZES = {"1.5b", "2.9b", "7.2b", "13.3b"}
 # "<arch_version>-<data_version>-<param_size>[-...]", e.g.
 # "rwkv7-g1j-1.5b" or "rwkv7-g1i-1.5b-20260805-ctx16384".
 MODEL_NAME_PATTERN = re.compile(r"^([a-z0-9]+)-([a-z][0-9][a-z0-9]*)-([0-9.]+[a-z]+)(?:-.*)?$")
+QWEN_NAME_PATTERN = re.compile(
+    r"^qwen(?P<version>\d+(?:\.\d+)?)-(?P<size>\d+(?:\.\d+)?b(?:-a\d+(?:\.\d+)?b)?)(?:-.*)?$",
+    re.IGNORECASE,
+)
 # Weight releases name their context window, e.g.
 # "rwkv7-g1k-13.3b-20260930-ctx25600"; the run directory keeps that revision.
 WEIGHT_CTX_PATTERN = re.compile(r"ctx(\d+)")
@@ -54,6 +58,7 @@ NEW_SAMPLING_FIELDS = {
     "frequency_penalty": "frequency_penalty",
     "penalty_decay": "penalty_decay",
     "seed": "seed",
+    "enable_thinking": "enable_thinking",
 }
 REQUIRED_SAMPLING_FIELDS = (
     "temp",
@@ -442,6 +447,16 @@ def _rwkv_model(model_name: str, ctx_len: int) -> dict[str, Any]:
     }
 
 
+def _model_identity(model_name: str, ctx_len: int) -> dict[str, Any]:
+    name = model_name.rsplit("/", 1)[-1]
+    if match := QWEN_NAME_PATTERN.fullmatch(name):
+        return {
+            "arch_version": "qwen",
+            "data_version": match["version"],
+            "param_size": match["size"].lower(),
+            "ctx_len": ctx_len,
+        }
+    return _rwkv_model(name, ctx_len)
 
 
 def _sampling_config(
@@ -449,6 +464,8 @@ def _sampling_config(
     task_config: dict[str, Any],
     model_args: dict[str, Any],
     task_metadata: dict[str, Any],
+    *,
+    is_qwen: bool = False,
 ) -> dict[str, Any]:
     run_config = results["config"]
     effective = {
@@ -483,7 +500,20 @@ def _sampling_config(
     if run_config.get("evaluation_protocol"):
         sampling["seed_strategy"] = "base_plus_repeat_ord"
         sampling["evaluation_protocol"] = run_config["evaluation_protocol"]
-    missing = [field for field in REQUIRED_SAMPLING_FIELDS if field not in sampling]
+    if is_qwen:
+        profile_cap = (run_config.get("sampling_config") or {}).get("max_gen_toks")
+        if profile_cap is not None:
+            sampling["max_generated_tokens"] = min(
+                sampling["max_generated_tokens"], profile_cap
+            )
+        if not isinstance(sampling.get("enable_thinking"), bool):
+            raise ScoreboardError("Qwen publication requires an explicit boolean enable_thinking")
+    required = [
+        field
+        for field in REQUIRED_SAMPLING_FIELDS
+        if not (is_qwen and field == "penalty_decay")
+    ]
+    missing = [field for field in required if field not in sampling]
     if missing:
         raise ScoreboardError(
             "publication sampling_config is missing required fields: "
@@ -846,7 +876,7 @@ def build_score(
     policy = _task_policy(config, benchmark_name, benchmark_name)
 
     run_config = results["config"]
-    if run_config.get("model") in {"rwkv7-remote", "rwkv7-remote-chat"}:
+    if run_config.get("model") in {"rwkv7-remote", "rwkv7-remote-chat", "qwen-remote-chat"}:
         from lm_eval.api.checkpoint import EVALUATION_PROTOCOL_VERSION
         if run_config.get("evaluation_protocol") != EVALUATION_PROTOCOL_VERSION:
             raise ScoreboardError("Historical generative artifacts require a versioned raw-answer replay before publication")
@@ -945,7 +975,7 @@ def build_score(
         benchmark_name, num_samples, completions / num_samples, policy
     )
     revision = (run_config.get("metadata") or {}).get("weight_revision")
-    model = _rwkv_model(
+    model = _model_identity(
         model_name,
         _weight_ctx_len(revision or model_name, *artifact_hint_paths),
     )
@@ -958,6 +988,7 @@ def build_score(
             sole_config,
             model_args,
             sole_config.get("metadata") or {},
+            is_qwen=model["arch_version"] == "qwen",
         ),
         "score": headline,
         "truncation_rate": truncation_rate,
@@ -965,6 +996,10 @@ def build_score(
         "wrong_details": merged_buckets["wrong"],
         "failed_details": merged_buckets["failed"],
     }
+    if model["arch_version"] == "qwen":
+        expected_mode = "CoT" if payload["sampling_config"]["enable_thinking"] else "NoCoT"
+        if config.cot_mode != expected_mode:
+            raise ScoreboardError("publication.cot_mode disagrees with Qwen enable_thinking")
     return benchmark_info, payload
 
 

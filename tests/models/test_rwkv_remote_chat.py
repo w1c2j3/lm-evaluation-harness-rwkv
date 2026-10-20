@@ -7,7 +7,7 @@ from lm_eval.api.instance import Instance
 from lm_eval.api.registry import get_model
 from lm_eval.models.api_models import JsonChatStr
 from lm_eval.models.rwkv_choice import build_choice_prompt
-from lm_eval.models.rwkv_remote_chat import RWKV7RemoteChat
+from lm_eval.models.rwkv_remote_chat import QwenRemoteChat, RWKV7RemoteChat
 
 
 def _build(**kwargs):
@@ -16,12 +16,43 @@ def _build(**kwargs):
     return RWKV7RemoteChat(**kwargs)
 
 
+def _qwen(**kwargs):
+    return QwenRemoteChat(
+        model="Qwen/Qwen3.5-2B",
+        base_url="http://localhost:8000/v1/chat/completions",
+        enable_thinking=False,
+        temperature=0.7,
+        top_p=0.8,
+        top_k=20,
+        **kwargs,
+    )
 
 
+def test_qwen_registered_and_uses_standard_chat_payload(monkeypatch):
+    monkeypatch.delenv("RWKV_API_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "qwen-test-key")
+    assert get_model("qwen-remote-chat") is QwenRemoteChat
+    model = _qwen(max_gen_toks=1024)
+    options = {"until": ["END"], "max_gen_toks": 32, "temperature": 99}
+    payload = model._create_payload("hi", generate=True, gen_kwargs=options)
+    assert payload["messages"] == [{"role": "user", "content": "hi"}]
+    assert payload["max_tokens"] == 32
+    assert payload["temperature"] == 0.7
+    assert payload["top_p"] == 0.8
+    assert payload["top_k"] == 20
+    assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+    assert payload["stop"] == ["END"]
+    assert "generation_config" not in payload
+    assert "penalty_decay" not in payload
+    assert model.api_key == "qwen-test-key"
+    assert options["temperature"] == 99
+    assert model.get_model_info()["sampling_config"]["max_gen_toks"] == 1024
+    assert model._create_payload("hi", generate=True, gen_kwargs={"max_gen_toks": 2000})["max_tokens"] == 1024
 
 
-def test_chat_choice_scoring_preserves_roles_and_all_rollouts(monkeypatch):
-    model = _build()
+@pytest.mark.parametrize("cls", [RWKV7RemoteChat, QwenRemoteChat])
+def test_chat_choice_scoring_preserves_roles_and_all_rollouts(cls, monkeypatch):
+    model = _qwen(max_gen_toks=128) if cls is QwenRemoteChat else _build()
     history = [
         {"role": "system", "content": "Be precise"},
         {"role": "user", "content": "Example"},
@@ -56,8 +87,24 @@ def test_chat_choice_scoring_preserves_roles_and_all_rollouts(monkeypatch):
     assert json.loads(responses[0].prompt) == sent
     assert len(responses[0].rollouts) == 2
     assert responses[0].rollouts[1]["index"] == 1
+    if cls is QwenRemoteChat:
+        assert captured[0].args[1]["max_gen_toks"] == 128
 
 
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"enable_thinking": "false"},
+        {"temperature": float("nan")},
+        {"top_k": True},
+        {"top_p": 0},
+        {"penalty_decay": 0.99},
+    ],
+)
+def test_qwen_rejects_invalid_profile(override):
+    profile = {"enable_thinking": False, "temperature": 0.7, "top_p": 0.8, "top_k": 20}
+    with pytest.raises(ValueError):
+        QwenRemoteChat.validate_profile({**profile, **override})
 
 
 def test_rwkv7_remote_chat_construction_defaults(monkeypatch):
