@@ -546,3 +546,16 @@ enabled = true
 尚未实现 RWKV `no_think`。现有
 `rwkv7_g1j_campaign_ruler_xquad_nocot_full_scoreboard.toml` 仍会在配置校验时失败；
 不能静默换为 `fake_think` 并沿用相同实验身份。
+
+## 13. Qwen Chat API 支持
+
+`qwen-remote-chat` 使用 vLLM 的 `/v1/chat/completions`。评估端保留
+system/user/assistant 消息边界，只在最后一个 user turn 加入选择题菜单，
+由服务端官方 Qwen 模板拼接上下文，并通过 `enable_thinking` 控制思考模式。
+Qwen 使用独立的显式采样 profile，不发送 RWKV 模板参数或 `penalty_decay`。
+完整 TOML 示例见 [Qwen Chat API](docs/config_files.md#qwen-chat-api)。
+
+配置支持 Qwen/RWKV 混合 campaign；Scoreboard 保留 Qwen 版本、参数量、
+思考开关与 `weight_revision` 中的原生上下文身份。生成题和选择题均有模拟 HTTP、
+结果工件及上传数据构建回归。尚未连接真实 Qwen 服务，也未验证在线 Scoreboard
+接收端对 Qwen 身份的兼容性。

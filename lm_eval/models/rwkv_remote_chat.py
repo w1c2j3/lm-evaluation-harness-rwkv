@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import os
 from collections import Counter, defaultdict
 from functools import cached_property
@@ -399,3 +400,147 @@ class RWKV7RemoteChat(LocalChatCompletion):
                 )
             generations.extend(choices)
         return generations
+
+
+@register_model("qwen-remote-chat")
+class QwenRemoteChat(RWKV7RemoteChat):
+    """Qwen Chat API transport sharing the generative avg@k choice scorer.
+
+    The shared scorer only builds lettered prompts and records rollouts. Qwen
+    uses its server's official chat template and explicit sampling parameters;
+    no RWKV generation profile or template arguments are sent to the server.
+    """
+
+    @staticmethod
+    def validate_profile(profile: dict) -> dict:
+        required = {"enable_thinking", "temperature", "top_p", "top_k"}
+        allowed = required | {"presence_penalty", "frequency_penalty", "max_gen_toks"}
+        if missing := required - profile.keys():
+            raise ValueError(
+                "Missing Qwen profile fields: " + ", ".join(sorted(missing))
+            )
+        if unknown := profile.keys() - allowed:
+            raise ValueError(
+                "Unknown Qwen profile fields: " + ", ".join(sorted(unknown))
+            )
+        value = {
+            "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
+            "max_gen_toks": MAX_NEW_TOKENS,
+            **profile,
+        }
+        if not isinstance(value["enable_thinking"], bool):
+            raise ValueError("qwen_profile.enable_thinking must be a boolean")  # noqa: TRY004 - config validation uses ValueError.
+        for name in ("temperature", "top_p", "presence_penalty", "frequency_penalty"):
+            number = value[name]
+            if (
+                isinstance(number, bool)
+                or not isinstance(number, (int, float))
+                or not math.isfinite(number)
+            ):
+                raise ValueError(f"qwen_profile.{name} must be finite and numeric")
+        if value["temperature"] < 0 or not 0 < value["top_p"] <= 1:
+            raise ValueError(
+                "Qwen temperature must be >= 0 and top_p must be in (0, 1]"
+            )
+        for name in ("top_k", "max_gen_toks"):
+            number = value[name]
+            if (
+                isinstance(number, bool)
+                or not isinstance(number, int)
+                or number < (-1 if name == "top_k" else 1)
+            ):
+                raise ValueError(f"qwen_profile.{name} is invalid")
+        return value
+
+    def __init__(
+        self,
+        *,
+        model,
+        base_url,
+        enable_thinking,
+        temperature,
+        top_p,
+        top_k,
+        presence_penalty=0.0,
+        frequency_penalty=0.0,
+        max_gen_toks=MAX_NEW_TOKENS,
+        **kwargs,
+    ):
+        profile = self.validate_profile(
+            {
+                "enable_thinking": enable_thinking,
+                "temperature": temperature,
+                "top_p": top_p,
+                "top_k": top_k,
+                "presence_penalty": presence_penalty,
+                "frequency_penalty": frequency_penalty,
+                "max_gen_toks": max_gen_toks,
+            }
+        )
+        self.enable_thinking = profile.pop("enable_thinking")
+        self._generation_profile = profile
+        # Initialize the generic Chat transport directly; the RWKV initializer
+        # loads RWKV-specific presets which have no meaning for Qwen.
+        LocalChatCompletion.__init__(
+            self,
+            model=model,
+            base_url=base_url,
+            tokenizer_backend=None,
+            tokenized_requests=False,
+            max_gen_toks=max_gen_toks,
+            **kwargs,
+        )
+        self._avg_k_samples = {}
+        self._avg_k_parsed = {}
+
+    @property
+    def tokenizer_name(self) -> str:
+        return f"{self.model}:qwen_official:enable_thinking={self.enable_thinking}"
+
+    @property
+    def api_key(self) -> str:
+        return os.environ.get("OPENAI_API_KEY", "")
+
+    def get_model_info(self) -> dict:
+        return {
+            "sampling_config": {
+                **self._generation_profile,
+                "enable_thinking": self.enable_thinking,
+                "seed": self._seed,
+            }
+        }
+
+    def _rollout_instances(self, prompt: str | JsonChatStr, k: int) -> list[Instance]:
+        requests = super()._rollout_instances(prompt, k)
+        for request in requests:
+            request.args[1]["max_gen_toks"] = self._max_gen_toks
+        return requests
+
+    def _create_payload(
+        self, messages, generate=False, gen_kwargs=None, **kwargs
+    ) -> dict:
+        if isinstance(messages, str):
+            messages = [{"role": "user", "content": messages}]
+        # The profile is authoritative for both regular generation and choice
+        # rollouts, so the reported sampling matches the requests actually sent.
+        profile = {
+            key: value
+            for key, value in self._generation_profile.items()
+            if key != "max_gen_toks"
+        }
+        effective = {**(gen_kwargs or {}), **profile}
+        if not any(name in effective for name in ("max_gen_toks", "max_tokens")):
+            effective["max_gen_toks"] = self._max_gen_toks
+        for name in ("max_gen_toks", "max_tokens"):
+            if name in effective:
+                effective[name] = min(effective[name], self._max_gen_toks)
+        payload = LocalChatCompletion._create_payload(
+            self,
+            messages,
+            generate=generate,
+            gen_kwargs=effective,
+            **kwargs,
+        )
+        payload["chat_template_kwargs"] = {"enable_thinking": self.enable_thinking}
+        return payload

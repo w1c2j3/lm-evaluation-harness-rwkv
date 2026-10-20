@@ -738,6 +738,54 @@ def test_pre_fix_artifact_reports_docs_from_its_sample_evidence(tmp_path):
     assert score["score"] == pytest.approx(0.47)
 
 
+@pytest.mark.parametrize(
+    "name,size",
+    [
+        ("Qwen/Qwen3.5-0.8B", "0.8b"),
+        ("Qwen3.5-2B", "2b"),
+        ("qwen3.5-4b", "4b"),
+        ("Qwen3.5-9B", "9b"),
+        ("Qwen3.5-35B-A3B", "35b-a3b"),
+    ],
+)
+def test_qwen_publication_uses_explicit_revision_and_no_rwkv_penalties(
+    tmp_path, name, size
+):
+    run_dir = tmp_path / "qwen_run_without_context_in_path"
+    leaves = {
+        "leaf": _leaf_artifacts(run_dir, "leaf", docs=2, k=2, avg_at_k=0.75, plain=0.5)
+    }
+    results = _benchmark_doc(run_dir, leaves)
+    results["config"] = {
+        "model": "qwen-remote-chat",
+        "evaluation_protocol": "rwkv-generative-v2",
+        "model_args": {"model": name},
+        "metadata": {"weight_revision": name + "-ctx262144"},
+        "sampling_config": {
+            "temperature": 0.7,
+            "top_p": 0.8,
+            "top_k": 20,
+            "presence_penalty": 1.5,
+            "frequency_penalty": 0.0,
+            "enable_thinking": False,
+            "max_gen_toks": 1024,
+            "seed": 77,
+        },
+    }
+    info, score = build_score(
+        results, _publish_config({"bench": {"field": "reasoning"}})
+    )
+    assert score["model"] == {
+        "arch_version": "qwen",
+        "data_version": "3.5",
+        "param_size": size,
+        "ctx_len": 262144,
+    }
+    assert info["avg_k"] == 2
+    assert score["score"] == 0.75
+    assert score["sampling_config"]["max_generated_tokens"] == 1024
+    assert score["sampling_config"]["enable_thinking"] is False
+    assert "penalty_decay" not in score["sampling_config"]
 
 
 def test_publication_uses_actual_profile_over_task_sampling_metadata():
@@ -901,3 +949,63 @@ def test_rwkv_remote_wire_to_scoreboard_with_open_thinking(tmp_path, monkeypatch
     assert info["avg_k"] == 2
     assert score["score"] == (0.5 if output_type == "multiple_choice" else 0.25)
     assert sorted({payload["seed"] for payload in sent}) == [40, 41]
+
+
+@pytest.mark.parametrize("output_type", ["generate_until", "multiple_choice"])
+def test_qwen_http_evaluation_artifacts_and_scoreboard_round_trip(tmp_path, monkeypatch, output_type):
+    from unittest.mock import Mock
+
+    fixtures = tmp_path / "fixtures"
+    data = _write_data_and_leaves(fixtures, [("qwen_leaf", "exact_match")])
+    if output_type == "multiple_choice":
+        data.write_text(json.dumps([{"question": "Which pet?", "choices": ["cats", "dogs"], "answer": 0}]), encoding="utf-8")
+        path = fixtures / "qwen_leaf.yaml"
+        path.write_text(path.read_text().replace("output_type: generate_until", "output_type: multiple_choice\ndoc_to_choice: choices").replace("metric: exact_match", "metric: acc"))
+    sent = []
+
+    def post(url, *, json, **kwargs):
+        sent.append(json)
+        content = "A" if output_type == "multiple_choice" else "lol"
+        reason = "length" if "3+3" in json["messages"][-1]["content"] else "stop"
+        response = Mock(ok=True)
+        response.json.return_value = {"choices": [{"index": 0, "message": {"content": content}, "finish_reason": reason}]}
+        return response
+
+    monkeypatch.setattr("lm_eval.models.api_models.requests.post", post)
+    monkeypatch.setattr(evaluator, "avg_at_k_plan", lambda *a, **k: (2, "avg@2"))
+    captured = {}
+    config = _publish_config({"qwen_leaf": {"field": "reasoning"}})
+
+    def callback(task_name, artifact_paths):
+        results = json.loads(Path(artifact_paths["results"]).read_text())
+        captured["publication"] = build_score(results, config)
+        return {"publication": "validated", "uploaded": False}
+
+    evaluator.simple_evaluate(
+        model="qwen-remote-chat",
+        model_args={"model": "Qwen3.5-2B", "base_url": "http://localhost:8000/v1/chat/completions",
+                    "enable_thinking": False, "temperature": 0.7, "top_p": 0.8, "top_k": 20,
+                    "max_gen_toks": 128, "num_concurrent": 1},
+        tasks=["qwen_leaf"], task_manager=TaskManager(include_path=str(fixtures), include_defaults=False),
+        apply_chat_template=True, log_samples=True, bootstrap_iters=0,
+        metadata={"weight_revision": "Qwen3.5-2B-ctx262144"},
+        evaluation_tracker=EvaluationTracker(output_path=str(tmp_path / "run")),
+        task_callback=callback,
+        benchmark_map={"qwen_leaf": BenchmarkSpec(name="qwen_leaf", strategy="standalone", leaf_task_names=("qwen_leaf",))},
+    )
+    info, score = captured["publication"]
+    assert info["avg_k"] == 2
+    assert score["model"]["ctx_len"] == 262144
+    assert all(payload["chat_template_kwargs"] == {"enable_thinking": False} for payload in sent)
+    if output_type == "multiple_choice":
+        assert len(sent) == 2
+        assert score["score"] == 1.0
+        assert "A. cats" in sent[0]["messages"][-1]["content"]
+        assert score["passed_details"][0]["answer"] == "A"
+        assert score["passed_details"][0]["ground_truth"] == "A"
+    else:
+        assert len(sent) == 8
+        assert info["num_samples"] == 4
+        assert score["score"] == 0.25
+        assert score["truncation_rate"] == 0.25
+        assert score["sampling_config"]["max_generated_tokens"] == 32

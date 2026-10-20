@@ -111,6 +111,7 @@ VERSIONED_CONFIG_FIELDS = {
     "publish",
     "scoreboard",
     "rwkv_profile",
+    "qwen_profile",
     "samples",
     "schema_version",
     "seed",
@@ -129,7 +130,6 @@ VERSIONED_REQUIRED_FIELDS = {
     "max_num_seqs",
     "model_name",
     "output_dir",
-    "rwkv_profile",
     "schema_version",
 }
 RWKV_PROFILE_FIELDS = {
@@ -141,6 +141,7 @@ RWKV_PROMPT_TEMPLATES = {"assistant", "bot", "function_calling"}
 RWKV_GENERATION_PROMPTS = {"fake_think", "open_think"}
 RWKV_WKV_MODES = {"fp16", "fp32io16"}
 RWKV_BACKENDS = {"rwkv7-http", "rwkv7-remote", "rwkv7-remote-chat"}
+QWEN_BACKENDS = {"qwen-remote-chat"}
 # The two campaign-container keys are consumed by `_expand_models` before a
 # model entry is validated, so a `[[models]]` entry may carry every field a
 # single-model config may carry except the containers themselves.
@@ -536,7 +537,6 @@ class EvaluatorConfig:
                 + ", ".join(duplicates)
             )
 
-
     @classmethod
     def _load_config_mapping(
         cls,
@@ -608,9 +608,10 @@ class EvaluatorConfig:
         if isinstance(config["schema_version"], bool) or config["schema_version"] != 1:
             raise ValueError("schema_version must be 1")
         backend = config["backend"]
-        if backend not in RWKV_BACKENDS:
+        if backend not in RWKV_BACKENDS | QWEN_BACKENDS:
             raise ValueError(
-                "backend must be one of: " + ", ".join(sorted(RWKV_BACKENDS))
+                "backend must be one of: "
+                + ", ".join(sorted(RWKV_BACKENDS) + sorted(QWEN_BACKENDS))
             )
 
         tokenizer_name = config.get("tokenizer_name")
@@ -623,7 +624,9 @@ class EvaluatorConfig:
 
         model_name = cls._non_empty_string(config["model_name"], "model_name")
         completion_path = (
-            "/v1/chat/completions" if backend == "rwkv7-remote-chat" else "/v1/completions"
+            "/v1/chat/completions"
+            if backend in {"rwkv7-remote-chat", "qwen-remote-chat"}
+            else "/v1/completions"
         )
         base_url = cls._completion_url(config["base_url"], completion_path)
         benchmarks = cls._string_list(config["benchmarks"], "benchmarks")
@@ -647,42 +650,25 @@ class EvaluatorConfig:
             else None
         )
 
-        profile = config["rwkv_profile"]
-        if not isinstance(profile, dict):
-            raise TypeError("rwkv_profile must be a table")
-        unknown_profile = sorted(set(profile) - RWKV_PROFILE_FIELDS)
-        if unknown_profile:
-            raise ValueError(
-                "Unknown RWKV profile fields: " + ", ".join(unknown_profile)
-            )
-        missing_profile = sorted(RWKV_PROFILE_FIELDS - set(profile))
-        if missing_profile:
-            raise ValueError(
-                "Missing RWKV profile fields: " + ", ".join(missing_profile)
-            )
+        is_qwen = backend in QWEN_BACKENDS
+        if is_qwen and "rwkv_profile" in config:
+            raise ValueError("qwen-remote-chat uses qwen_profile, not rwkv_profile")
+        if not is_qwen and "qwen_profile" in config:
+            raise ValueError("qwen_profile requires backend = qwen-remote-chat")
+        if is_qwen:
+            profile = config.get("qwen_profile")
+            if not isinstance(profile, dict):
+                raise TypeError("qwen_profile must be a table")
+            from lm_eval.models.rwkv_remote_chat import QwenRemoteChat
 
-        prompt_template = cls._non_empty_string(
-            profile["prompt_template"], "rwkv_profile.prompt_template"
-        )
-        if prompt_template not in RWKV_PROMPT_TEMPLATES:
-            raise ValueError(
-                "rwkv_profile.prompt_template must be one of: "
-                + ", ".join(sorted(RWKV_PROMPT_TEMPLATES))
+            qwen_profile = QwenRemoteChat.validate_profile(profile)
+            prompt_template = "qwen_official"
+            generation_prompt = (
+                "open_think" if qwen_profile["enable_thinking"] else "no_think"
             )
-        generation_prompt = cls._non_empty_string(
-            profile["generation_prompt"], "rwkv_profile.generation_prompt"
-        )
-        if generation_prompt not in RWKV_GENERATION_PROMPTS:
-            raise ValueError(
-                "rwkv_profile.generation_prompt must be one of: "
-                + ", ".join(sorted(RWKV_GENERATION_PROMPTS))
-            )
-        wkv_mode = cls._non_empty_string(profile["wkv_mode"], "rwkv_profile.wkv_mode")
-        if wkv_mode not in RWKV_WKV_MODES:
-            raise ValueError(
-                "rwkv_profile.wkv_mode must be one of: "
-                + ", ".join(sorted(RWKV_WKV_MODES))
-            )
+            wkv_mode = None
+        else:
+            prompt_template, generation_prompt, wkv_mode = cls._rwkv_profile(config)
 
         apply_chat_template = cls._boolean(
             config.get("apply_chat_template", True), "apply_chat_template"
@@ -707,7 +693,6 @@ class EvaluatorConfig:
             )
         ):
             raise ValueError("seed must contain four integers")
-
 
         publication_value = config.get("publication")
         if publication_value is None:
@@ -738,7 +723,15 @@ class EvaluatorConfig:
             if checkpoint_value.get("dir") is not None:
                 cls._non_empty_string(checkpoint_value["dir"], "checkpoint.dir")
 
-        if backend in ("rwkv7-http", "rwkv7-remote-chat"):
+        if is_qwen:
+            model_args = {
+                "model": model_name,
+                "num_concurrent": max_num_seqs,
+                "max_length": max_length,
+                **qwen_profile,
+                "seed": seed[2],
+            }
+        elif backend in ("rwkv7-http", "rwkv7-remote-chat"):
             model_args = {
                 "model": model_name,
                 "rwkv_prompt_template": prompt_template,
@@ -791,6 +784,19 @@ class EvaluatorConfig:
             "publication": publication,
             "checkpoint": checkpoint_value,
         }
+        if is_qwen:
+            normalized["metadata"].pop("wkv_mode")
+            if tokenizer_name is not None:
+                # Synthetic benchmarks such as RULER need the weight's
+                # tokenizer for dataset construction. Chat rendering still
+                # belongs to the server and does not load it in the model.
+                normalized["metadata"]["tokenizer"] = tokenizer_name
+            if isinstance(publication, dict) and publication.get("enabled"):
+                expected_mode = "CoT" if qwen_profile["enable_thinking"] else "NoCoT"
+                if publication.get("cot_mode") != expected_mode:
+                    raise ValueError(
+                        "publication.cot_mode disagrees with qwen_profile.enable_thinking"
+                    )
         if "weight_revision" in config:
             normalized["metadata"]["weight_revision"] = cls._non_empty_string(
                 config["weight_revision"], "weight_revision"
@@ -864,6 +870,47 @@ class EvaluatorConfig:
                 )
             normalized["trust_remote_code"] = trust_remote_code
         return normalized
+
+    @classmethod
+    def _rwkv_profile(cls, config: dict[str, Any]) -> tuple[str, str, str]:
+        profile = config.get("rwkv_profile")
+        if not isinstance(profile, dict):
+            raise TypeError("rwkv_profile must be a table")
+        unknown_profile = sorted(set(profile) - RWKV_PROFILE_FIELDS)
+        if unknown_profile:
+            raise ValueError(
+                "Unknown RWKV profile fields: " + ", ".join(unknown_profile)
+            )
+        missing_profile = sorted(RWKV_PROFILE_FIELDS - set(profile))
+        if missing_profile:
+            raise ValueError(
+                "Missing RWKV profile fields: " + ", ".join(missing_profile)
+            )
+
+        prompt_template = cls._non_empty_string(
+            profile["prompt_template"], "rwkv_profile.prompt_template"
+        )
+        if prompt_template not in RWKV_PROMPT_TEMPLATES:
+            raise ValueError(
+                "rwkv_profile.prompt_template must be one of: "
+                + ", ".join(sorted(RWKV_PROMPT_TEMPLATES))
+            )
+        generation_prompt = cls._non_empty_string(
+            profile["generation_prompt"], "rwkv_profile.generation_prompt"
+        )
+        if generation_prompt not in RWKV_GENERATION_PROMPTS:
+            raise ValueError(
+                "rwkv_profile.generation_prompt must be one of: "
+                + ", ".join(sorted(RWKV_GENERATION_PROMPTS))
+            )
+        wkv_mode = cls._non_empty_string(profile["wkv_mode"], "rwkv_profile.wkv_mode")
+        if wkv_mode not in RWKV_WKV_MODES:
+            raise ValueError(
+                "rwkv_profile.wkv_mode must be one of: "
+                + ", ".join(sorted(RWKV_WKV_MODES))
+            )
+
+        return prompt_template, generation_prompt, wkv_mode
 
     @staticmethod
     def _non_empty_string(value: Any, name: str) -> str:
